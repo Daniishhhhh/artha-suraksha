@@ -78,14 +78,21 @@ class MockPrismaStream:
         if not self.enabled:
             raise RuntimeError("MockPrismaStream requires USE_MOCK_GNANI=true")
 
-    async def send_frame(self, frame: bytes | bytearray | memoryview) -> None:
+    async def send_frame(
+        self,
+        frame: bytes | bytearray | memoryview,
+        *,
+        emit_processing: bool = True,
+    ) -> None:
         """Accept one and only one correctly aligned PCM frame."""
 
         try:
             self._require_enabled()
             validate_pcm_frame(frame)
             self.frames_received += 1
-            if not any(event.get("type") == "processing" for event in self._events):
+            if emit_processing and not any(
+                event.get("type") == "processing" for event in self._events
+            ):
                 self._events.append(
                     {
                         "type": "processing",

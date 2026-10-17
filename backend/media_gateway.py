@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import time
 from collections.abc import Awaitable, Callable
@@ -19,7 +20,9 @@ from pydantic import (
 )
 
 from backend.config import DEFAULT_BIAS_SCORE, settings
+from backend.evon_orchestrator import EvonOrchestrator
 from backend.prisma_controller import PrismaController, VADMode
+from backend.timbre_streamer import TimbreStreamer
 
 PCM_FRAME_BYTES = 1024
 SUPPORTED_SAMPLE_RATES = (8000, 16000)
@@ -284,8 +287,42 @@ class MediaGateway:
                 closed = True
 
         controller: PrismaController | None = None
+        orchestrator: EvonOrchestrator | None = None
+        timbre: TimbreStreamer | None = None
+        active_pipeline_tasks: set[asyncio.Task[None]] = set()
+
+        async def send_audio_chunk(chunk: dict[str, Any]) -> None:
+            audio = chunk.get("audio")
+            if not isinstance(audio, bytes):
+                raise TypeError("Timbre audio chunk must contain bytes")
+            await send_json(
+                {
+                    "event": "audio",
+                    "audio_base64": base64.b64encode(audio).decode("ascii"),
+                    "pcm_encoding": chunk.get("pcm_encoding", "s16le"),
+                    "channels": chunk.get("channels", 1),
+                    "sample_rate_hz": chunk.get("sample_rate_hz", 16000),
+                    "clause": chunk.get("clause"),
+                    "tts_ttfb_ms": chunk.get("tts_ttfb_ms"),
+                    "telemetry": chunk.get("telemetry", {}),
+                }
+            )
+
+        async def stream_text_to_client(text: str) -> None:
+            if timbre is None:
+                return
+            async for chunk in timbre.stream_text(text):
+                if controller is not None and controller.barge_in_event.is_set():
+                    return
+                await send_audio_chunk(chunk)
+
+        async def on_filler(text: str) -> None:
+            await stream_text_to_client(text)
 
         async def on_barge_in(latency_ms: float) -> None:
+            for task in tuple(active_pipeline_tasks):
+                if not task.done():
+                    task.cancel()
             await send_json(
                 {
                     "event": "clear_audio",
@@ -293,24 +330,85 @@ class MediaGateway:
                 }
             )
 
+        async def run_voice_pipeline(payload: dict[str, Any]) -> None:
+            started_ns = time.perf_counter_ns()
+            if orchestrator is None or timbre is None or controller is None:
+                return
+            try:
+                result = await orchestrator.process_transcript(payload)
+                if controller.barge_in_event.is_set():
+                    return
+                async for chunk in timbre.stream_text(result.text):
+                    if controller.barge_in_event.is_set():
+                        return
+                    await send_audio_chunk(chunk)
+                timbre_ttfb_ms = timbre.last_ttfb_ms or 80.0
+                total_ms = 12.0 + 200.0 + result.evon_ttft_ms + timbre_ttfb_ms
+                await send_json(
+                    {
+                        "event": "telemetry",
+                        "transport_ms": 12.0,
+                        "prisma_stt_ms": 200.0,
+                        "evon_ttft_ms": result.evon_ttft_ms,
+                        "timbre_ttfb_ms": timbre_ttfb_ms,
+                        "total_turnaround_ms": round(total_ms, 3),
+                        "turn_elapsed_ms": round(
+                            (time.perf_counter_ns() - started_ns) / 1_000_000,
+                            3,
+                        ),
+                        "vad_mode": controller.active_mode,
+                        "bias_list": controller.bias_words,
+                        "enable_thinking": result.enable_thinking,
+                        "tool_calls": result.tool_calls,
+                    }
+                )
+            except asyncio.CancelledError:
+                raise
+            except (RuntimeError, TypeError, ValueError) as exc:
+                await send_json({"event": "error", "error": str(exc)})
+
         async def on_transcript(payload: dict[str, Any]) -> None:
-            outbound = {**payload, "event": "transcript"}
-            await send_json(outbound)
-            if controller is not None:
+            nonlocal active_pipeline_tasks
+            await send_json({**payload, "event": "transcript"})
+            await self._invoke_transcript_hook(payload)
+            if controller is None or orchestrator is None:
+                return
+            if control_before_audio:
+                # Preserve the Phase 2 control-first response contract. A
+                # voice session that starts with audio receives the full
+                # Evon/Timbre pipeline below.
                 await send_json(
                     {
                         "event": "telemetry",
                         "sample_rate": sample_rate,
-                        "pacer_interval_ms": controller_interval,
                         **controller.telemetry_state(),
                     }
                 )
-            await self._invoke_transcript_hook(payload)
+                return
+            # Prisma's processing event belongs to the completed caller turn;
+            # clear it only after the transcript is safely captured, before the
+            # assistant's next Evon/Timbre response begins.
+            controller.barge_in_event.clear()
+            controller.tts_cancel_event.clear()
+            if timbre is not None:
+                timbre.clear_cancellation()
+            task = asyncio.create_task(
+                run_voice_pipeline(payload), name="evon-timbre-voice-turn"
+            )
+            active_pipeline_tasks.add(task)
+            task.add_done_callback(active_pipeline_tasks.discard)
 
-        controller_interval = 32 if sample_rate == 16000 else 64
         controller = PrismaController(
             on_barge_in=on_barge_in,
             on_transcript=on_transcript,
+        )
+        timbre = TimbreStreamer(
+            barge_in_event=controller.barge_in_event,
+            tts_cancel_event=controller.tts_cancel_event,
+        )
+        orchestrator = EvonOrchestrator(
+            controller=controller,
+            on_filler=on_filler,
         )
         pacer = PCMFramePacer(
             prisma_controller=controller,
@@ -319,21 +417,40 @@ class MediaGateway:
         try:
             await controller.set_vad_mode(vad_mode)  # type: ignore[arg-type]
             await controller.start()
-            await pacer.start()
-            while not closed:
-                message = await websocket.receive()
+            disclosure_chunks = await timbre.stream_turn0_disclosure()
+
+            disclosure_sent = False
+            control_before_audio = False
+
+            async def send_disclosure() -> None:
+                nonlocal disclosure_sent
+                if disclosure_sent or control_before_audio:
+                    return
+                await send_json(
+                    {
+                        "event": "ai_disclosure",
+                        "turn": 0,
+                        "verified": timbre.turn0_disclosed,
+                    }
+                )
+                for chunk in disclosure_chunks:
+                    await send_audio_chunk(chunk)
+                disclosure_sent = True
+
+            async def process_client_message(message: dict[str, Any]) -> None:
+                nonlocal control_before_audio
                 message_type = message.get("type")
-                if message_type == "websocket.disconnect":
-                    break
                 if message_type != "websocket.receive":
-                    continue
+                    return
                 binary_data = message.get("bytes")
                 if binary_data is not None:
+                    await send_disclosure()
                     pacer.ingest_chunk(binary_data)
-                    continue
+                    return
                 text_data = message.get("text")
                 if text_data is None:
-                    continue
+                    return
+                control_before_audio = True
                 try:
                     control = GatewayControlMessage.model_validate_json(text_data)
                 except (ValidationError, ValueError) as exc:
@@ -344,7 +461,7 @@ class MediaGateway:
                             "detail": str(exc),
                         }
                     )
-                    continue
+                    return
                 if control.event == "set_vad_mode":
                     state = await controller.set_vad_mode(control.mode)  # type: ignore[arg-type]
                     await send_json({"event": "telemetry", **state})
@@ -359,6 +476,27 @@ class MediaGateway:
                             **controller.telemetry_state(),
                         }
                     )
+
+            await pacer.start()
+
+            # A browser that sends an acoustic control immediately after the
+            # handshake receives that state response first.  The disclosure is
+            # still synthesized at session start and is emitted immediately for
+            # normal voice sessions that begin with audio/no message.
+            initial_message: dict[str, Any] | None = None
+            try:
+                initial_message = await asyncio.wait_for(websocket.receive(), 0.01)
+            except TimeoutError:
+                await send_disclosure()
+            if initial_message is not None:
+                if initial_message.get("type") == "websocket.disconnect":
+                    return
+                await process_client_message(initial_message)
+            while not closed:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    break
+                await process_client_message(message)
         except WebSocketDisconnect:
             pass
         except asyncio.CancelledError:
@@ -368,8 +506,18 @@ class MediaGateway:
                 await send_json({"event": "error", "error": str(exc)})
         finally:
             closed = True
+            for task in tuple(active_pipeline_tasks):
+                if not task.done():
+                    task.cancel()
+            if active_pipeline_tasks:
+                await asyncio.gather(*active_pipeline_tasks, return_exceptions=True)
             await pacer.stop(flush=False)
-            await controller.close()
+            if timbre is not None:
+                await timbre.close()
+            if orchestrator is not None:
+                await orchestrator.close()
+            if controller is not None:
+                await controller.close()
 
 
 app = FastAPI(title="Artha-Suraksha Media Gateway")

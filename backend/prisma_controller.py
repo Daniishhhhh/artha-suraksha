@@ -241,8 +241,9 @@ class PrismaController:
             if channel is None:
                 raise RuntimeError("active Prisma channel is not connected")
             if isinstance(channel, MockPrismaStream):
-                await channel.send_frame(frame)
-                if not self._mock_turn_started[self._active_mode]:
+                turn_started = self._mock_turn_started[self._active_mode]
+                await channel.send_frame(frame, emit_processing=not turn_started)
+                if not turn_started:
                     self._mock_turn_started[self._active_mode] = True
                     await channel.simulate_speech()
             else:
@@ -405,7 +406,6 @@ class PrismaController:
             ) / 1_000_000
         is_final = bool(event.get("is_final")) or event.get("status") == "completed"
         if event_type in {"transcript", "final", "completed"} and is_final:
-            self._mock_turn_started[mode] = False
             text = event.get("text") or event.get("transcript")
             if self._active_mode == "DIGIT_CAPTURE" and isinstance(text, str):
                 event["digit_transcript"] = self.accumulate_digit_transcript(text)

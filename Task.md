@@ -21,7 +21,7 @@
 * **Estimated Effort:** 1 Session (~2–3 hours).
 * **RECOMMENDED MODEL:** **GPT "Astra"** — *Unmatched long-context capacity to generate the comprehensive multi-clause vernacular `policy_context.md` alongside consistent cross-file schemas in `config.py`, `database.py`, and `mock_replay.py` in one pass.*
 
-### Phase 2: TLS 1.3 Media Gateway, 1,024-Byte Frame Pacer & Prisma v2.5 Acoustic Controller — **[ACTIVE]**
+### Phase 2: TLS 1.3 Media Gateway, 1,024-Byte Frame Pacer & Prisma v2.5 Acoustic Controller — **[COMPLETE]**
 * **Goal:** Build the asynchronous WebSocket proxy, monotonic 1,024-byte PCM ring-buffer pacer, dual-socket VAD manager (`350 ms` fast turn vs. `800 ms` digit capture), mid-call `x-bias-list` updater, and `<30 ms` barge-in trigger[cite: 8, 9].
 * **Deliverables:** `backend/media_gateway.py`, `backend/prisma_controller.py`, and `tests/test_phase2_acoustic.py`.
 * **Dependencies:** Phase 1 (`config.py`, `mock_replay.py`).
@@ -32,7 +32,7 @@
 * **Estimated Effort:** 1–2 Sessions (~4 hours).
 * **RECOMMENDED MODEL:** **Claude Opus 4.8** — *Best-in-class systems engineering and concurrency reasoning for deterministic `asyncio` ring-buffer pacing, dual-WebSocket state machines, and race-condition-free barge-in cancellation.*
 
-### Phase 3: Evon v3.3 Sovereign Logic Engine & Timbre v2.5/v3.0 Clause Streamer
+### Phase 3: Evon v3.3 Sovereign Logic Engine & Timbre v2.5/v3.0 Clause Streamer — **[COMPLETE]**
 * **Goal:** Wire the end-to-end voice reasoning and synthesis loop connecting Prisma transcripts to Evon v3.3 (`enable_thinking=False/True` + SQLite tools) and streaming punctuation-chunked clauses into Timbre WSS with Turn-0 AI disclosure[cite: 5, 6, 10, 14].
 * **Deliverables:** `backend/evon_orchestrator.py`, `backend/timbre_streamer.py`, full pipeline wiring in `backend/media_gateway.py`, and `tests/test_phase3_orchestration.py`.
 * **Dependencies:** Phase 1 & Phase 2.
@@ -66,8 +66,8 @@
 
 ## 3. Master Progress Checklist
 - [x] **Phase 1 [COMPLETE]:** `.env.example`, `requirements.txt`, `backend/config.py`, `backend/database.py`, `backend/mock_replay.py`, `backend/policy_context.md`, and `tests/test_phase1_foundation.py`.
-- [ ] **Phase 2 [ACTIVE]:** `backend/media_gateway.py` (1,024-byte pacer) and `backend/prisma_controller.py` (raw WSS VAD, `x-bias-list`, `<30 ms` barge-in).
-- [ ] **Phase 3:** `backend/evon_orchestrator.py` (128K context + tools) and `backend/timbre_streamer.py` (Turn-0 disclosure + clause streaming).
+- [x] **Phase 2 [COMPLETE]:** `backend/media_gateway.py` (1,024-byte pacer) and `backend/prisma_controller.py` (raw WSS VAD, `x-bias-list`, `<30 ms` barge-in).
+- [x] **Phase 3 [COMPLETE]:** `backend/evon_orchestrator.py` (128K context + tools) and `backend/timbre_streamer.py` (Turn-0 disclosure + clause streaming).
 - [ ] **Phase 4:** `frontend/audio_worklet.js`, `frontend/noise_mixer.ts`, and `frontend/telemetry_dashboard.tsx` (Screen 1).
 - [ ] **Phase 5:** Batch STT (`with_denoise=True`) + Evon thinking compliance tab (Screen 2), 6-check benchmark, and 60s demo submission before Nov 10, 2026[cite: 1, 8, 13].
 
@@ -87,5 +87,14 @@
 2. Implement the FastAPI `/health` and `/ws/call` gateway with monotonic 1,024-byte pacing, validated control events, transcript callbacks, and clean task teardown.
 3. Add focused pacer, cadence, VAD, lexicon, barge-in, and WebSocket integration tests without live network calls.
 4. Run both Phase 1 and Phase 2 suites plus Ruff, then review the diff for Phase 2-only scope.
+
+### Phase 3 Session Execution Plan — 2026-10-17
+1. Implement the zero-SSML Timbre clause chunker, Turn-0 disclosure, mock/live streaming adapters, and barge-in cancellation checks.
+2. Implement Evon 128K policy loading, dual thinking-mode routing, validated SQLite tool calls, language/format guards, and deterministic mock responses.
+3. Wire transcript-to-Evon-to-Timbre callbacks into the existing media gateway without creating Phase 4 or Phase 5 modules.
+4. Add closed-loop mock WebSocket tests, run all Phase 1–3 checks, and commit only the verified Phase 3 changes.
+
+### Phase 3 Closeout — 2026-10-17
+- Verified zero-credit mock STT → Evon/SQLite → Timbre closed-loop behavior, Turn-0 disclosure, protected financial formatting, and barge-in cancellation.
 
 > Phase 1 closeout note: all five foundation documents are now present for Phase 2 review. The PRD and rules confirm the 1,024-byte pacing, raw WebSocket, synthetic-data, and barge-in constraints; no cross-file conflict was found for this phase.
