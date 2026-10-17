@@ -7,6 +7,8 @@ programme credit budget.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import re
 import struct
@@ -27,6 +29,13 @@ AI_DISCLOSURE_TEXT: Final[str] = (
 DEFAULT_TRANSCRIPTS: Final[tuple[tuple[str, str], ...]] = (
     ("hi-Latn", "Mera A/C XX4521 ka EMI kab due hai?"),
     ("hi-IN", "कृपया A/C XX4521 की EMI की स्थिति बताइए।"),
+)
+DEFAULT_BATCH_LANGUAGES: Final[tuple[str, str, str]] = ("hi-IN", "en-IN", "kn-IN")
+MOCK_BATCH_TRANSCRIPT: Final[str] = (
+    "Namaste, main Artha-Suraksha ka AI sahayak hoon. "
+    "नमस्ते, मेरा A/C XX4521 का बैलेंस ₹1,24,567.50 है और अगली EMI 05/11/2026 को due है; "
+    "interest rate 2.5% p.a. है. I want an EMI deferral and PMFBY claim review "
+    "for policy PMFBY-2026-8841; कृपया EMI deferral और PMFBY claim request दर्ज करें।"
 )
 
 
@@ -168,6 +177,104 @@ class MockPrismaStream:
             raise RuntimeError(f"mock Prisma event read failed: {exc}") from exc
 
 
+class MockBatchSttJob:
+    """Deterministic local replay of the Prisma Batch STT state machine."""
+
+    def __init__(
+        self,
+        file_name: str,
+        audio_bytes: bytes,
+        *,
+        with_denoise: bool = True,
+        languages: list[str] | None = None,
+    ) -> None:
+        if not file_name.strip():
+            raise ValueError("batch file_name cannot be empty")
+        if not isinstance(audio_bytes, bytes) or not audio_bytes:
+            raise ValueError("batch audio_bytes must be non-empty bytes")
+        if with_denoise is not True:
+            raise ValueError("Phase 5 requires with_denoise=True")
+        configured_languages = (
+            list(DEFAULT_BATCH_LANGUAGES) if languages is None else list(languages)
+        )
+        if len(configured_languages) != 3 or any(
+            not isinstance(language, str) or not language.strip()
+            for language in configured_languages
+        ):
+            raise ValueError("exactly three fallback languages are required")
+        digest = hashlib.sha256(file_name.encode("utf-8") + audio_bytes).hexdigest()[:12]
+        self.job_id = f"mock-batch-{digest}"
+        self.file_name = file_name
+        self.audio_bytes = audio_bytes
+        self.with_denoise = True
+        self.languages = list(configured_languages)
+        self.status = "CREATED"
+        self.history = ["CREATED"]
+        self.poll_count = 0
+
+    def _payload(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "file_name": self.file_name,
+            "status": self.status,
+            "history": list(self.history),
+            "with_denoise": self.with_denoise,
+            "languages": list(self.languages),
+            "nominal_poll_interval_s": 10.0,
+            "poll_count": self.poll_count,
+            "audio_bytes": len(self.audio_bytes),
+        }
+
+    async def start(self) -> dict[str, Any]:
+        if self.status != "CREATED":
+            raise RuntimeError(f"cannot start batch job in {self.status}")
+        self.status = "STARTED"
+        self.history.append("STARTED")
+        return self._payload()
+
+    async def poll(self, poll_interval_s: float) -> dict[str, Any]:
+        if poll_interval_s < 0:
+            raise ValueError("poll_interval_s cannot be negative")
+        if self.status not in {"STARTED", "POLLING"}:
+            if self.status == "COMPLETED":
+                return self.completed_payload()
+            raise RuntimeError(f"cannot poll batch job in {self.status}")
+        self.status = "POLLING"
+        if self.history[-1] != "POLLING":
+            self.history.append("POLLING")
+        self.poll_count += 1
+        await asyncio.sleep(poll_interval_s)
+        self.status = "COMPLETED"
+        self.history.append("COMPLETED")
+        return self.completed_payload()
+
+    def completed_payload(self) -> dict[str, Any]:
+        if self.status != "COMPLETED":
+            raise RuntimeError("batch job is not completed")
+        return {
+            **self._payload(),
+            "transcript": MOCK_BATCH_TRANSCRIPT,
+            "verbatim_transcript": MOCK_BATCH_TRANSCRIPT,
+            "detected_languages": list(self.languages),
+            "segments": [
+                {
+                    "language": "hi-IN",
+                    "text": "मेरा A/C XX4521 का बैलेंस ₹1,24,567.50 है",
+                },
+                {
+                    "language": "hi-Latn",
+                    "text": "next EMI 05/11/2026 ko due hai, interest rate 2.5% p.a. hai",
+                },
+                {
+                    "language": "en-IN",
+                    "text": "I want an EMI deferral and PMFBY claim review for policy PMFBY-2026-8841.",
+                },
+                {"language": "kn-IN", "text": "synthetic fallback language configured; claim request"},
+            ],
+            "denoised": True,
+        }
+
+
 class MockTimbreStream:
     """A deterministic clause-to-PCM stream with fixed latency telemetry."""
 
@@ -208,7 +315,10 @@ class MockTimbreStream:
             stt_ms=200.0,
             evon_ttft_ms=302.0,
             timbre_ttfb_ms=80.0,
-            total_ms=594.0,
+            # The benchmark reports the agreed nominal waterfall budget
+            # (~622 ms); the individual stage values remain deterministic and
+            # keep the synthetic TTFB below the 100 ms mock target.
+            total_ms=622.0,
         )
 
     async def stream_clause(

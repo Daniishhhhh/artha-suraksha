@@ -31,6 +31,34 @@ export const DESIGN_TOKENS = {
 
 type Screen = "live" | "audit";
 type ViewState = "empty" | "loading" | "error" | "success";
+type BatchStage = "CREATED" | "STARTED" | "POLLING" | "COMPLETED" | "EVON_THINKING_AUDIT";
+
+const BATCH_LANGUAGES = ["hi-IN", "en-IN", "kn-IN"] as const;
+
+interface ComplianceReport {
+  job_id: string;
+  denoised: boolean;
+  detected_languages: string[];
+  verbatim_transcript: string;
+  ai_disclosure_verified: boolean;
+  synthetic_pii_compliant: boolean;
+  extracted_entities: Record<string, unknown>;
+  emi_or_claim_mutations: Record<string, unknown>[];
+  handoff_triggered: boolean;
+  sentiment: string;
+  enable_thinking_used: boolean;
+  reasoning_trace: string;
+}
+
+interface BatchResponse {
+  job_id: string;
+  status: string;
+  history?: string[];
+  batch_result?: Record<string, unknown>;
+  compliance_report?: ComplianceReport;
+  report?: ComplianceReport;
+  error?: string;
+}
 
 interface WaterfallState {
   transport_ms: number;
@@ -64,6 +92,17 @@ const INITIAL_WATERFALL: WaterfallState = {
 
 function numberValue(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+async function fileAsBase64(file: File): Promise<string> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return window.btoa(binary);
 }
 
 function Badge({
@@ -132,20 +171,185 @@ function MetricBar({
   );
 }
 
-function EmptyAuditShell() {
+function BatchAuditPanel() {
+  const [batchFile, setBatchFile] = useState<File | null>(null);
+  const [sampleFile, setSampleFile] = useState("synthetic_noisy_call_xx4521.wav");
+  const [withDenoise, setWithDenoise] = useState(true);
+  const [batchState, setBatchState] = useState<ViewState>("empty");
+  const [batchError, setBatchError] = useState<string | null>(null);
+  const [batchJob, setBatchJob] = useState<BatchResponse | null>(null);
+  const [pollLabel, setPollLabel] = useState("Ready for mock replay");
+  const abortRef = useRef<AbortController | null>(null);
+  const pollTimerRef = useRef<number | null>(null);
+
+  const clearBatchPolling = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    if (pollTimerRef.current !== null) {
+      window.clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearBatchPolling, [clearBatchPolling]);
+
+  const runBatchAudit = useCallback(async (retryFile?: File | null) => {
+    clearBatchPolling();
+    const file = retryFile === undefined ? batchFile : retryFile;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setBatchState("loading");
+    setBatchError(null);
+    setBatchJob(null);
+    setPollLabel("Job Created · Starting Prisma batch lifecycle");
+    try {
+      const payload: Record<string, unknown> = {
+        file_name: file?.name || sampleFile,
+        with_denoise: withDenoise,
+        languages: [...BATCH_LANGUAGES],
+        poll_interval_s: 0.01,
+      };
+      if (file) payload.audio_base64 = await fileAsBase64(file);
+      const response = await fetch("/api/batch/audit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      const raw: unknown = await response.json();
+      if (!isRecord(raw)) throw new Error("Batch audit returned an invalid JSON object");
+      if (!response.ok || raw.status === "ERROR") {
+        const detail = typeof raw.detail === "string" ? raw.detail : "Batch audit failed";
+        throw new Error(`${detail} (HTTP ${response.status})`);
+      }
+      if (typeof raw.job_id !== "string") throw new Error("Batch audit did not return a job ID");
+      setPollLabel("Polling (/stt/v3/batch/jobs every 10s)");
+      let finalJob = raw as unknown as BatchResponse;
+      // The primary endpoint completes the local mock in milliseconds.  Keep
+      // the GET fallback for a live/asynchronous gateway response so the same
+      // view can render intermediate CREATED/STARTED/POLLING states.
+      for (let attempt = 0; finalJob.status !== "COMPLETED" && attempt < 30; attempt += 1) {
+        if (finalJob.status === "ERROR") throw new Error(finalJob.error || "Batch audit failed");
+        const jobResponse = await fetch(`/api/batch/jobs/${encodeURIComponent(raw.job_id)}`, {
+          signal: controller.signal,
+        });
+        const jobRaw: unknown = await jobResponse.json();
+        if (!jobResponse.ok || !isRecord(jobRaw)) throw new Error(`Batch polling failed (HTTP ${jobResponse.status})`);
+        finalJob = jobRaw as unknown as BatchResponse;
+        if (finalJob.status !== "COMPLETED") {
+          await new Promise<void>((resolve) => {
+            pollTimerRef.current = window.setTimeout(resolve, 10_000);
+          });
+        }
+      }
+      if (finalJob.status !== "COMPLETED") throw new Error("Batch polling timed out");
+      setBatchJob(finalJob);
+      setPollLabel("Evon Thinking Audit... · enable_thinking=True");
+      setBatchState("success");
+    } catch (caught) {
+      if (caught instanceof DOMException && caught.name === "AbortError") return;
+      setBatchError(caught instanceof Error ? caught.message : "Batch audit failed");
+      setBatchState("error");
+      setPollLabel("Error / Fallback");
+    }
+  }, [batchFile, clearBatchPolling, sampleFile, withDenoise]);
+
+  const history = batchJob?.history || [];
+  const report = batchJob?.compliance_report || batchJob?.report;
+  const transcript = report?.verbatim_transcript || String(batchJob?.batch_result?.verbatim_transcript || "");
+  const languages = report?.detected_languages || BATCH_LANGUAGES;
+  const stageComplete = (stage: BatchStage) => history.includes(stage);
+  const statusTone = (passed: boolean) => (passed ? "emerald" : "rose") as "emerald" | "rose";
+
   return (
-    <div className="rounded-xl border border-dashed border-slate-700 bg-slate-950/40 p-8 text-center">
-      <p className="mb-2 text-sm font-semibold text-slate-200">No Batch Job Running</p>
-      <p className="mx-auto max-w-md text-sm text-slate-400">
-        Upload or select a synthetic noisy call recording to audit. Phase 5 will wire
-        `/stt/v3/batch/jobs` with `with_denoise=True` and Evon `enable_thinking=True`.
-      </p>
-      <div className="mt-6 grid gap-2 text-left text-xs text-slate-500 sm:grid-cols-4">
-        <span className="rounded-lg bg-slate-800 p-3">Job Created</span>
-        <span className="rounded-lg bg-slate-800 p-3">Started</span>
-        <span className="rounded-lg bg-slate-800 p-3">Polling every 10s</span>
-        <span className="rounded-lg bg-slate-800 p-3">Evon Thinking Audit</span>
-      </div>
+    <div className="space-y-4">
+      <Panel title="Screen 2: Supervisor Batch Audit Tab" eyebrow="Phase 5 · denoised batch STT + compliance artifact">
+        <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+          <div className="space-y-3">
+            <label className="grid gap-2 text-sm text-slate-300">
+              Upload WAV recording
+              <input
+                type="file"
+                accept=".wav,audio/wav"
+                className="rounded-lg border border-slate-700 bg-slate-800 p-2 text-xs text-slate-300"
+                onChange={(event) => setBatchFile(event.target.files?.[0] || null)}
+              />
+            </label>
+            <label className="grid gap-2 text-sm text-slate-300">
+              Or select synthetic fixture
+              <select className="rounded-lg border border-slate-700 bg-slate-800 p-2 text-slate-100" value={sampleFile} onChange={(event) => setSampleFile(event.target.value)}>
+                <option value="synthetic_noisy_call_xx4521.wav">8 kHz noisy code-switched call · A/C XX4521</option>
+                <option value="pmfby_clause4b_dispute_8khz.wav">PMFBY Clause 4B dispute · 8 kHz synthetic replay</option>
+              </select>
+            </label>
+            <label className="flex items-center justify-between rounded-lg bg-slate-800 p-3 text-sm text-slate-200">
+              <span>Denoise before batch STT <small className="block text-xs text-slate-500">with_denoise=True is mandatory</small></span>
+              <input type="checkbox" checked={withDenoise} onChange={(event) => setWithDenoise(event.target.checked)} aria-label="Toggle batch denoise" />
+            </label>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-slate-500">Fallback languages</span>
+              {BATCH_LANGUAGES.map((language) => <Badge key={language} tone="blue">{language}</Badge>)}
+            </div>
+            <button className="rounded-lg bg-blue-500 px-4 py-2 text-sm font-bold text-white disabled:cursor-not-allowed disabled:opacity-50" onClick={() => void runBatchAudit()} disabled={batchState === "loading"}>
+              {batchState === "loading" ? "Running Audit…" : "Run Batch STT & Evon Thinking Audit"}
+            </button>
+            {batchState === "error" && <button className="ml-2 rounded-lg border border-rose-400 px-4 py-2 text-sm text-rose-200" onClick={() => void runBatchAudit()}>Retry</button>}
+          </div>
+          <div className="rounded-lg border border-slate-700 bg-slate-950/60 p-3">
+            <p className="mb-3 text-xs uppercase tracking-[0.2em] text-slate-500">Lifecycle · {pollLabel}</p>
+            <div className="grid gap-2 text-xs">
+              {(["CREATED", "STARTED", "POLLING", "EVON_THINKING_AUDIT", "COMPLETED"] as BatchStage[]).map((stage) => (
+                <div key={stage} className={`flex items-center justify-between rounded-lg p-3 ${stageComplete(stage) ? "bg-emerald-500/15 text-emerald-200" : "bg-slate-800 text-slate-500"}`}>
+                  <span>{stage === "EVON_THINKING_AUDIT" ? "Evon Thinking Audit" : stage}</span>
+                  <span>{stageComplete(stage) ? "PASS" : "PENDING"}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </Panel>
+
+      {batchState === "empty" && <div className="rounded-xl border border-dashed border-slate-700 bg-slate-950/40 p-8 text-center"><p className="mb-2 text-sm font-semibold text-slate-200">Empty state: No Batch Job Running</p><p className="text-sm text-slate-400">Select a synthetic noisy call or upload a WAV to begin a zero-credit audit.</p></div>}
+      {batchState === "loading" && <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-200" aria-live="polite">Loading / Streaming: {pollLabel}</div>}
+      {batchState === "error" && <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200" role="alert">Error / Fallback: {batchError || "Batch audit failed"}</div>}
+
+      {batchState === "success" && report && (
+        <div className="grid gap-4 xl:grid-cols-2" aria-live="polite">
+          <Panel title="Denoised / Native Transcript" eyebrow={`${languages.join(" · ")} · ${batchJob?.job_id || report.job_id}`}>
+            <p className="mb-3 text-xs text-slate-500">Verbatim batch transcript</p>
+            <p className="rounded-lg bg-slate-950 p-4 text-sm leading-6 text-slate-200">{transcript}</p>
+            <div className="mt-3 flex flex-wrap gap-2">{languages.map((language) => <Badge key={language} tone="blue">{language}</Badge>)}</div>
+          </Panel>
+          <Panel title="Evon Compliance Report" eyebrow="enable_thinking=True · zero-credit mock artifact">
+            <div className="flex flex-wrap gap-2">
+              <Badge tone={statusTone(report.ai_disclosure_verified)}>AI Disclosure: {report.ai_disclosure_verified ? "PASS" : "FAIL"}</Badge>
+              <Badge tone={statusTone(report.synthetic_pii_compliant)}>PII Check: {report.synthetic_pii_compliant ? "PASS" : "FAIL"}</Badge>
+              <Badge tone={statusTone(report.denoised)}>Denoise: {report.denoised ? "PASS" : "FAIL"}</Badge>
+              <Badge tone={statusTone(report.enable_thinking_used)}>Evon Thinking: {report.enable_thinking_used ? "PASS" : "FAIL"}</Badge>
+              <Badge tone={report.handoff_triggered ? "rose" : "slate"}>Human Handoff: {report.handoff_triggered ? "TRIGGERED" : "NOT TRIGGERED"}</Badge>
+            </div>
+            <div className="mt-4 grid gap-3 sm:grid-cols-2">
+              <div className="rounded-lg bg-slate-950 p-3">
+                <p className="mb-2 text-xs uppercase tracking-[0.16em] text-slate-500">Extracted financial entities</p>
+                <div className="space-y-1 text-xs text-slate-300">
+                  {[
+                    ["Account", report.extracted_entities.account_id],
+                    ["Balance", report.extracted_entities.balance],
+                    ["Due date", report.extracted_entities.due_date],
+                    ["Interest", report.extracted_entities.interest_rate],
+                    ["Policy", report.extracted_entities.policy_id],
+                  ].map(([label, value]) => <p key={label}><span className="text-slate-500">{label}:</span> {String(value || "not detected")}</p>)}
+                </div>
+              </div>
+              <div className="rounded-lg bg-slate-950 p-3">
+                <p className="mb-2 text-xs uppercase tracking-[0.16em] text-slate-500">EMI / claim mutation log</p>
+                {report.emi_or_claim_mutations.length === 0 ? <p className="text-xs text-slate-500">No mutation request detected.</p> : <ul className="space-y-1 text-xs text-slate-300">{report.emi_or_claim_mutations.map((mutation, index) => <li key={`${String(mutation.type || "mutation")}-${index}`}>• {String(mutation.type || "mutation")} · {String(mutation.tool || "audit evidence")}</li>)}</ul>}
+              </div>
+            </div>
+            <pre aria-live="polite" className="mt-4 max-h-72 overflow-auto rounded-lg bg-slate-950 p-3 text-xs text-emerald-300">{JSON.stringify(report, null, 2)}</pre>
+          </Panel>
+        </div>
+      )}
     </div>
   );
 }
@@ -406,11 +610,7 @@ export default function TelemetryDashboard() {
                 </div>
               </Panel>
             </>
-          ) : (
-            <Panel title="Screen 2: Supervisor Batch Audit Tab" eyebrow="Phase 5 shell — intentionally not wired in Phase 4">
-              <EmptyAuditShell />
-            </Panel>
-          )}
+          ) : <BatchAuditPanel />}
 
           {error && <div className="rounded-xl border border-rose-500/40 bg-rose-500/10 p-4 text-sm text-rose-200" role="alert">Error / Fallback: {error}</div>}
           {!error && viewState === "empty" && <div className="rounded-xl border border-slate-700 bg-slate-900 p-4 text-sm text-slate-500">Empty state: Ready to Connect — Select Mock Replay (0 Credits) with {SYNTHETIC_ACCOUNT} seeded.</div>}

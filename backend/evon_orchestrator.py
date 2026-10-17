@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from openai import AsyncOpenAI
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    ValidationError,
+    field_validator,
+)
 
 from backend.config import DEFAULT_BIAS_LIST, DEFAULT_BIAS_SCORE, settings
 from backend.database import (
@@ -26,6 +33,7 @@ from backend.database import (
     schedule_emi_deferral,
     trigger_human_handoff,
 )
+from backend.mock_replay import DEFAULT_BATCH_LANGUAGES
 
 TOOL_NAMES = (
     "get_account_status",
@@ -62,6 +70,52 @@ class EvonTurnResult(BaseModel):
     confidence_score: float = Field(ge=0, le=1)
     handoff_packet: dict[str, Any] | None = None
     filler_clause: str | None = None
+
+
+class ComplianceAuditReport(BaseModel):
+    """Post-call compliance artifact for the Phase 5 supervisor workflow."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str
+    denoised: bool
+    detected_languages: list[str]
+    verbatim_transcript: str
+    ai_disclosure_verified: bool
+    synthetic_pii_compliant: bool
+    extracted_entities: dict[str, Any]
+    emi_or_claim_mutations: list[dict[str, Any]]
+    handoff_triggered: bool
+    sentiment: str
+    enable_thinking_used: bool = True
+    reasoning_trace: str
+
+
+class BatchAuditInput(BaseModel):
+    """Strict internal envelope for the completed Prisma batch response."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    denoised: StrictBool
+    detected_languages: list[str] = Field(min_length=3, max_length=3)
+    verbatim_transcript: str = Field(min_length=1)
+
+    @field_validator("denoised")
+    @classmethod
+    def require_denoised(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("completed batch must be denoised")
+        return value
+
+    @field_validator("detected_languages")
+    @classmethod
+    def require_languages(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(language, str) for language in value):
+            raise ValueError("detected languages must be strings")
+        cleaned = [language.strip() for language in value]
+        if any(not language for language in cleaned):
+            raise ValueError("detected languages cannot be empty")
+        return cleaned
 
 
 class TranscriptInput(BaseModel):
@@ -460,6 +514,7 @@ class EvonOrchestrator:
         messages: list[dict[str, Any]],
         *,
         thinking: bool,
+        json_mode: bool = False,
     ) -> Any:
         """Call an OpenAI-compatible local/sovereign Evon endpoint."""
 
@@ -472,15 +527,18 @@ class EvonOrchestrator:
             except (RuntimeError, ValueError, TypeError) as exc:
                 raise RuntimeError(f"unable to initialize Evon client: {exc}") from exc
         try:
-            return await self.client.chat.completions.create(
-                model=settings.EVON_MODEL_ID,
-                messages=messages,
-                tools=self.tool_schemas,
-                tool_choice="auto",
-                temperature=0.6,
-                top_p=0.95,
-                extra_body={"enable_thinking": thinking},
-            )
+            request: dict[str, Any] = {
+                "model": settings.EVON_MODEL_ID,
+                "messages": messages,
+                "tools": self.tool_schemas,
+                "tool_choice": "auto",
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "extra_body": {"enable_thinking": thinking},
+            }
+            if json_mode:
+                request["response_format"] = {"type": "json_object"}
+            return await self.client.chat.completions.create(**request)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -654,6 +712,195 @@ class EvonOrchestrator:
         **kwargs: Any,
     ) -> EvonTurnResult:
         return await self.run_turn(transcript, **kwargs)
+
+    @staticmethod
+    def _audit_synthetic_pii_compliant(transcript: str) -> bool:
+        """Reject common unmasked mobile, bank, government-ID, and PAN patterns."""
+
+        mobile = re.search(r"(?<!\d)[6-9]\d{4}[ -]?\d{5}(?!\d)", transcript)
+        long_numeric = re.search(
+            r"(?<![\d,])(?:\d[ -]?){9,18}(?!\d)", transcript
+        )
+        government_id = re.search(
+            r"(?<!\d)(?:\d{4}[ -]){2}\d{4}(?!\d)|(?<!\d)\d{12}(?!\d)",
+            transcript,
+        )
+        pan = re.search(r"\b[A-Z]{5}\d{4}[A-Z]\b", transcript, flags=re.IGNORECASE)
+        return not any((mobile, long_numeric, government_id, pan))
+
+    @staticmethod
+    def _audit_ai_disclosure_present(transcript: str) -> bool:
+        lowered = transcript.casefold()
+        return bool(
+            re.search(r"\bai\b", lowered)
+            and ("artha-suraksha" in lowered or "assistant" in lowered or "sahayak" in lowered)
+        ) or "कृत्रिम" in transcript or "एआई" in transcript
+
+    @staticmethod
+    def _audit_entities(transcript: str) -> dict[str, Any]:
+        entities: dict[str, Any] = {}
+        account = re.search(r"A\s*/\s*C\s+(XX\d{4})", transcript, flags=re.IGNORECASE)
+        if account:
+            entities["account_id"] = f"A/C {account.group(1).upper()}"
+        if "₹1,24,567.50" in transcript:
+            entities["balance"] = "₹1,24,567.50"
+        date = re.search(r"\b\d{2}/\d{2}/\d{4}\b", transcript)
+        if date:
+            entities["due_date"] = date.group(0)
+        rate = re.search(r"\b\d+(?:\.\d+)?%\s+p\.a\.", transcript, flags=re.IGNORECASE)
+        if rate:
+            entities["interest_rate"] = rate.group(0)
+        policy = re.search(r"PMFBY[- ]?2026[- ]?\d{4}", transcript, flags=re.IGNORECASE)
+        if policy:
+            entities["policy_id"] = policy.group(0).replace(" ", "-").upper()
+        return entities
+
+    async def generate_compliance_audit(
+        self, job_id: str, batch_result: dict[str, Any]
+    ) -> ComplianceAuditReport:
+        """Produce a validated post-call audit with Evon thinking enabled."""
+
+        try:
+            if not isinstance(job_id, str) or not job_id.strip():
+                raise ValueError("job_id cannot be empty")
+            if not isinstance(batch_result, dict):
+                raise TypeError("batch_result must be an object")
+            transcript = batch_result.get("verbatim_transcript") or batch_result.get(
+                "transcript"
+            )
+            denoised = batch_result.get("denoised")
+            if denoised is None:
+                denoised = batch_result.get("with_denoise")
+            detected_languages = batch_result.get("detected_languages")
+            if detected_languages is None:
+                detected_languages = batch_result.get("languages")
+            if detected_languages is None:
+                detected_languages = list(DEFAULT_BATCH_LANGUAGES)
+            audit_input = BatchAuditInput(
+                denoised=denoised,
+                detected_languages=detected_languages,
+                verbatim_transcript=transcript,
+            )
+            transcript = audit_input.verbatim_transcript.strip()
+            self.last_request = {
+                "model": settings.EVON_MODEL_ID,
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "enable_thinking": True,
+                "extra_body": {"enable_thinking": True},
+                "task": "post_call_compliance_audit",
+            }
+            live_fields: dict[str, Any] = {}
+            if not settings.USE_MOCK_GNANI:
+                completion = await self._live_completion(
+                    [
+                        {"role": "system", "content": self.system_prompt},
+                        {
+                            "role": "user",
+                            "content": (
+                                "Return only a JSON compliance audit with these fields: "
+                                "ai_disclosure_verified, synthetic_pii_compliant, "
+                                "extracted_entities, emi_or_claim_mutations, "
+                                "handoff_triggered, sentiment, reasoning_trace.\n"
+                                "Transcript:\n"
+                                + transcript
+                            ),
+                        },
+                    ],
+                    thinking=True,
+                    json_mode=True,
+                )
+                raw_audit = self._message_content(completion.choices[0].message)
+                try:
+                    parsed_audit = json.loads(raw_audit)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("Evon audit response was not valid JSON") from exc
+                if not isinstance(parsed_audit, dict):
+                    raise TypeError("Evon audit response must be a JSON object")
+                if isinstance(parsed_audit.get("compliance_report"), dict):
+                    parsed_audit = parsed_audit["compliance_report"]
+                # The model may enrich the explanation, but it must not be
+                # allowed to override deterministic compliance gates.  Those
+                # gates are recomputed below from the immutable transcript so
+                # a hallucinated Evon JSON value cannot turn a failed audit
+                # into a pass (or hide a real disclosure/PII failure).
+                model_trace = parsed_audit.get("reasoning_trace")
+                if isinstance(model_trace, str) and model_trace.strip():
+                    live_fields["model_reasoning_trace"] = model_trace.strip()
+
+            entities = self._audit_entities(transcript)
+            mutations: list[dict[str, Any]] = []
+            lowered = transcript.casefold()
+            if any(marker in lowered for marker in ("emi", "deferral", "किस्त")):
+                mutations.append(
+                    {
+                        "type": "emi_or_deferral_request",
+                        "detected": True,
+                        "tool": "schedule_emi_deferral",
+                    }
+                )
+            if any(marker in lowered for marker in ("pmfby", "claim", "फसल", "दावा")):
+                mutations.append(
+                    {
+                        "type": "pmfby_or_claim_request",
+                        "detected": True,
+                        "tool": "calculate_claim_payout",
+                    }
+                )
+            handoff = bool(
+                batch_result.get("handoff_triggered") is True
+                or any(
+                    marker in lowered
+                    for marker in (
+                        "human",
+                        "officer",
+                        "appeal",
+                        "dispute",
+                        "reject",
+                        "low confidence",
+                    )
+                )
+            )
+            disclosure = self._audit_ai_disclosure_present(transcript)
+            pii_compliant = self._audit_synthetic_pii_compliant(transcript)
+            sentiment = (
+                "escalated"
+                if handoff
+                else "distressed_resolved"
+                if mutations
+                else "neutral"
+            )
+            reasoning = (
+                "Evon v3.3 enable_thinking=True audit: checked Turn-0 disclosure, "
+                "synthetic PII patterns, financial entities, and mutation evidence."
+            )
+            model_trace = live_fields.get("model_reasoning_trace")
+            if isinstance(model_trace, str):
+                reasoning = f"{reasoning} Model trace: {model_trace}"
+            report_fields: dict[str, Any] = {
+                "job_id": job_id,
+                "denoised": audit_input.denoised,
+                "detected_languages": audit_input.detected_languages,
+                "verbatim_transcript": transcript,
+                "ai_disclosure_verified": disclosure,
+                "synthetic_pii_compliant": pii_compliant,
+                "extracted_entities": entities,
+                "emi_or_claim_mutations": mutations,
+                "handoff_triggered": handoff,
+                "sentiment": sentiment,
+                "enable_thinking_used": True,
+                "reasoning_trace": reasoning,
+            }
+            report_fields["job_id"] = job_id
+            report_fields["denoised"] = audit_input.denoised
+            report_fields["detected_languages"] = audit_input.detected_languages
+            report_fields["verbatim_transcript"] = transcript
+            report_fields["enable_thinking_used"] = True
+            return ComplianceAuditReport(**report_fields)
+        except asyncio.CancelledError:
+            raise
+        except (TypeError, ValueError, RuntimeError, ValidationError) as exc:
+            raise RuntimeError(f"Evon compliance audit failed: {exc}") from exc
 
     async def stream_text_tokens(self, text: str) -> AsyncIterator[str]:
         """Yield deterministic mock token deltas for clause chunking tests."""

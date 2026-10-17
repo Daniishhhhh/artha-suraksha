@@ -8,6 +8,7 @@ mock mode it never constructs a network client.
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
 import re
@@ -16,8 +17,9 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
+import aiohttp
 import websockets
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from backend.config import (
     DEFAULT_BIAS_LIST,
@@ -26,7 +28,12 @@ from backend.config import (
     FAST_TURN_VAD,
     settings,
 )
-from backend.mock_replay import PCM_FRAME_BYTES, MockPrismaStream
+from backend.mock_replay import (
+    DEFAULT_BATCH_LANGUAGES,
+    PCM_FRAME_BYTES,
+    MockBatchSttJob,
+    MockPrismaStream,
+)
 
 VADMode = Literal["FAST_TURN", "DIGIT_CAPTURE"]
 BargeInHandler = Callable[[float], Awaitable[None] | None]
@@ -64,6 +71,36 @@ class PrismaInboundEvent(BaseModel):
     type: str = Field(min_length=1)
 
 
+class BatchJobRequest(BaseModel):
+    """Validated request envelope for the Prisma batch lifecycle."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    file_name: str = Field(min_length=1)
+    audio_bytes: bytes = Field(min_length=1)
+    with_denoise: bool = True
+    languages: list[str] = Field(default_factory=lambda: list(DEFAULT_BATCH_LANGUAGES))
+
+    @field_validator("with_denoise")
+    @classmethod
+    def require_denoise(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("with_denoise=True is mandatory for Phase 5")
+        return value
+
+    @field_validator("languages")
+    @classmethod
+    def require_three_languages(cls, value: list[str]) -> list[str]:
+        cleaned = [
+            language.strip()
+            for language in value
+            if isinstance(language, str) and language.strip()
+        ]
+        if len(cleaned) != 3:
+            raise ValueError("exactly three fallback languages are required")
+        return cleaned
+
+
 class PrismaController:
     """Manage primary/secondary Prisma channels and acoustic state."""
 
@@ -98,6 +135,7 @@ class PrismaController:
         self.tts_cancel_event = asyncio.Event()
         self._digit_segments: list[str] = []
         self._digit_transcript = ""
+        self._batch_jobs: dict[str, MockBatchSttJob | dict[str, Any]] = {}
 
     @property
     def active_mode(self) -> VADMode:
@@ -491,6 +529,227 @@ class PrismaController:
             "barge_in_latency_ms": self.last_barge_in_latency_ms,
             "connected": self._connected and not self._closed,
         }
+
+    @staticmethod
+    def _batch_tls13_context() -> ssl.SSLContext:
+        try:
+            context = ssl.create_default_context()
+            context.minimum_version = ssl.TLSVersion.TLSv1_3
+            context.maximum_version = ssl.TLSVersion.TLSv1_3
+            return context
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"unable to configure batch TLS 1.3: {exc}") from exc
+
+    async def _batch_live_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Make one live batch request with an isolated backend key header."""
+
+        try:
+            headers = {"X-API-Key-ID": settings.get_active_api_key()}
+            timeout = aiohttp.ClientTimeout(total=30.0)
+            connector = aiohttp.TCPConnector(ssl=self._batch_tls13_context())
+            async with (
+                aiohttp.ClientSession(
+                    connector=connector, timeout=timeout, headers=headers
+                ) as session,
+                session.request(method, url, json=payload) as response,
+            ):
+                response.raise_for_status()
+                result = await response.json()
+            if not isinstance(result, dict):
+                raise TypeError("batch response must be a JSON object")
+            return result
+        except asyncio.CancelledError:
+            raise
+        except (aiohttp.ClientError, OSError, TypeError, ValueError, RuntimeError) as exc:
+            raise RuntimeError(f"Prisma batch request failed: {exc}") from exc
+
+    async def create_batch_job(
+        self,
+        file_name: str,
+        audio_bytes: bytes,
+        with_denoise: bool = True,
+        languages: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Create a denoised, three-language Prisma batch job."""
+
+        try:
+            request = BatchJobRequest(
+                file_name=file_name,
+                audio_bytes=audio_bytes,
+                with_denoise=with_denoise,
+                languages=(
+                    list(DEFAULT_BATCH_LANGUAGES)
+                    if languages is None
+                    else languages
+                ),
+            )
+            if settings.USE_MOCK_GNANI:
+                job = MockBatchSttJob(
+                    request.file_name,
+                    request.audio_bytes,
+                    with_denoise=request.with_denoise,
+                    languages=request.languages,
+                )
+                self._batch_jobs[job.job_id] = job
+                return {
+                    "job_id": job.job_id,
+                    "status": "CREATED",
+                    "history": ["CREATED"],
+                    "with_denoise": True,
+                    "languages": request.languages,
+                    "nominal_poll_interval_s": 10.0,
+                }
+            payload = {
+                "file_name": request.file_name,
+                "audio_base64": base64.b64encode(request.audio_bytes).decode("ascii"),
+                "with_denoise": True,
+                "languages": request.languages,
+            }
+            result = await self._batch_live_request(
+                "POST", settings.GNANI_BATCH_STT_URL, payload=payload
+            )
+            job_id = result.get("job_id") or result.get("id")
+            if not isinstance(job_id, str) or not job_id:
+                raise ValueError("live batch response did not provide job_id")
+            result.setdefault("job_id", job_id)
+            result.setdefault("history", ["CREATED"])
+            result.setdefault("with_denoise", True)
+            result.setdefault("languages", request.languages)
+            result.setdefault("nominal_poll_interval_s", 10.0)
+            self._batch_jobs[job_id] = result
+            return result
+        except asyncio.CancelledError:
+            raise
+        except (ValidationError, TypeError, ValueError, RuntimeError) as exc:
+            raise RuntimeError(f"unable to create Prisma batch job: {exc}") from exc
+
+    async def start_batch_job(self, job_id: str) -> dict[str, Any]:
+        """Transition a created batch job to STARTED."""
+
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ValueError("job_id cannot be empty")
+        try:
+            job = self._batch_jobs.get(job_id)
+            if settings.USE_MOCK_GNANI:
+                if not isinstance(job, MockBatchSttJob):
+                    raise KeyError(f"unknown mock batch job: {job_id}")
+                return await job.start()
+            if not isinstance(job, dict):
+                raise KeyError(f"unknown live batch job: {job_id}")
+            result = await self._batch_live_request(
+                "POST", f"{settings.GNANI_BATCH_STT_URL}/{job_id}/start"
+            )
+            result.setdefault("job_id", job_id)
+            result.setdefault("status", "STARTED")
+            result.setdefault("history", ["CREATED", "STARTED"])
+            self._batch_jobs[job_id] = result
+            return result
+        except asyncio.CancelledError:
+            raise
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"unable to start Prisma batch job: {exc}") from exc
+
+    async def poll_batch_job(
+        self,
+        job_id: str,
+        poll_interval_s: float = 10.0,
+        max_attempts: int = 30,
+    ) -> dict[str, Any]:
+        """Poll until a batch transcript completes, preserving nominal cadence metadata."""
+
+        if poll_interval_s < 0 or max_attempts < 1:
+            raise ValueError("poll_interval_s must be non-negative and max_attempts >= 1")
+        try:
+            job = self._batch_jobs.get(job_id)
+            if settings.USE_MOCK_GNANI:
+                if not isinstance(job, MockBatchSttJob):
+                    raise KeyError(f"unknown mock batch job: {job_id}")
+                if job.status == "CREATED":
+                    await job.start()
+                for _ in range(max_attempts):
+                    result = await job.poll(poll_interval_s)
+                    if result.get("status") == "COMPLETED":
+                        return result
+                raise TimeoutError(f"batch job did not complete: {job_id}")
+
+            if not isinstance(job, dict):
+                raise KeyError(f"unknown live batch job: {job_id}")
+            prior_history = list(job.get("history", ["CREATED", "STARTED"]))
+            for _ in range(max_attempts):
+                result = await self._batch_live_request(
+                    "GET", f"{settings.GNANI_BATCH_STT_URL}/{job_id}"
+                )
+                status = str(result.get("status", "")).upper()
+                response_history = result.get("history")
+                history = (
+                    list(response_history)
+                    if isinstance(response_history, list)
+                    else list(prior_history)
+                )
+                for milestone in ("CREATED", "STARTED"):
+                    if milestone not in history:
+                        history.insert(0 if milestone == "CREATED" else len(history), milestone)
+                if "POLLING" not in history:
+                    history.append("POLLING")
+                result["history"] = history
+                result.setdefault("job_id", job_id)
+                self._batch_jobs[job_id] = result
+                if status in {"COMPLETED", "FAILED", "ERROR"}:
+                    if status != "COMPLETED":
+                        raise RuntimeError(f"batch job ended in {status}: {job_id}")
+                    if "COMPLETED" not in history:
+                        history.append("COMPLETED")
+                    return result
+                await asyncio.sleep(poll_interval_s)
+            raise TimeoutError(f"batch job polling timed out: {job_id}")
+        except asyncio.CancelledError:
+            raise
+        except (KeyError, OSError, RuntimeError, TimeoutError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"unable to poll Prisma batch job: {exc}") from exc
+
+    async def run_batch_stt_job(
+        self,
+        file_name: str,
+        audio_bytes: bytes,
+        *,
+        with_denoise: bool = True,
+        languages: list[str] | None = None,
+        poll_interval_s: float = 10.0,
+        max_attempts: int = 30,
+    ) -> dict[str, Any]:
+        """Run create → start → poll and return a completed denoised transcript."""
+
+        try:
+            created = await self.create_batch_job(
+                file_name, audio_bytes, with_denoise, languages
+            )
+            job_id = str(created["job_id"])
+            started = await self.start_batch_job(job_id)
+            completed = await self.poll_batch_job(
+                job_id, poll_interval_s=poll_interval_s, max_attempts=max_attempts
+            )
+            history = list(completed.get("history", started.get("history", [])))
+            return {
+                **completed,
+                "job_id": job_id,
+                "history": history,
+                "with_denoise": True,
+                "languages": list(
+                    completed.get("languages", created.get("languages", []))
+                ),
+                "poll_interval_s": poll_interval_s,
+                "nominal_poll_interval_s": 10.0,
+            }
+        except asyncio.CancelledError:
+            raise
+        except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"batch STT lifecycle failed: {exc}") from exc
 
     async def close(self) -> None:
         """Cancel receivers and close both live channels without leaking tasks."""

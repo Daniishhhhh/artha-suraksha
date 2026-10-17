@@ -54,7 +54,7 @@
 * **Estimated Effort:** 1–2 Sessions (~4 hours).
 * **RECOMMENDED MODEL:** **Gemini Pro (via agy)** — *Fastest and strongest at full-stack TypeScript, Web Audio API DSP (`AudioWorklet`), and polished Tailwind CSS telemetry dashboards.*
 
-### Phase 5: Supervisor Batch STT (`with_denoise`) Audit Pipeline & 60s Demo Verification
+### Phase 5: Supervisor Batch STT (`with_denoise`) Audit Pipeline & 60s Demo Verification — **[ACTIVE]**
 * **Goal:** Implement the `/stt/v3/batch/jobs` denoised polling pipeline + Evon `enable_thinking=True` compliance JSON generator (Screen 2), run the 6-check enterprise benchmark, and record the 60-second LinkedIn/X demo using `GNANI_API_KEY_DEMO`[cite: 1, 5, 8, 10, 13].
 * **Deliverables:** Batch STT methods in `backend/prisma_controller.py`, Screen 2 in `frontend/telemetry_dashboard.tsx`, `tests/benchmark_6_checks.py`, and final 60s demo artifact.
 * **Dependencies:** Phases 1–4.
@@ -69,7 +69,7 @@
 - [x] **Phase 2 [COMPLETE]:** `backend/media_gateway.py` (1,024-byte pacer) and `backend/prisma_controller.py` (raw WSS VAD, `x-bias-list`, `<30 ms` barge-in).
 - [x] **Phase 3 [COMPLETE]:** `backend/evon_orchestrator.py` (128K context + tools) and `backend/timbre_streamer.py` (Turn-0 disclosure + clause streaming).
 - [x] **Phase 4 [COMPLETE]:** `frontend/audio_worklet.js`, `frontend/noise_mixer.ts`, and `frontend/telemetry_dashboard.tsx` (Screen 1).
-- [ ] **Phase 5:** Batch STT (`with_denoise=True`) + Evon thinking compliance tab (Screen 2), 6-check benchmark, and 60s demo submission before Nov 10, 2026[cite: 1, 8, 13].
+- [ ] **Phase 5 [ACTIVE]:** Batch STT (`with_denoise=True`) + Evon thinking compliance tab (Screen 2), 6-check benchmark, and 60s demo submission before Nov 10, 2026[cite: 1, 8, 13].
 
 ## 4. Notes
 * Keep `USE_MOCK_GNANI=true` enabled during Phases 1–4 UI tests so your 5,000 programme credits remain intact for acoustic tuning and the Phase 5 final demo[cite: 1, 4].
@@ -105,5 +105,18 @@
 
 ### Phase 4 Closeout — 2026-10-17
 - Verified the browser PCM framing, local gateway protocol, zero-secret frontend audit, Screen 1 design tokens, accessibility states, and Phase 5 placeholder shell.
+
+### Phase 5 Session Execution Plan — 2026-10-17
+1. Add deterministic mock/live Prisma batch job lifecycle methods with denoise enforcement, three-language metadata, and nominal polling telemetry.
+2. Add the validated Evon `ComplianceAuditReport` and `enable_thinking=True` post-call audit with disclosure, synthetic-PII, entity, mutation, and handoff checks.
+3. Expose batch audit REST endpoints and wire the Screen 2 supervisor workflow without implementing deferred features.
+4. Add the six-check benchmark, run all Phase 1–5 checks plus Node/Ruff verification, and commit only Phase 5 changes.
+
+### Phase 5 Verification Closeout — 2026-10-17
+- Implemented the mock/live Prisma batch lifecycle with `with_denoise=True`, three-language fallback metadata, nominal 10-second polling telemetry, native-script/code-mixed synthetic transcript replay, and TLS 1.3 live request isolation.
+- Implemented the validated Evon `ComplianceAuditReport` with deterministic Turn-0 disclosure and synthetic-PII gates, extracted financial entities, mutation evidence, handoff state, and `enable_thinking=True` request telemetry.
+- Wired JSON, multipart, and raw-file batch REST flows, in-memory job status lookup, the six-check scorecard, and the Screen 2 supervisor audit workflow with retry/error states.
+- Verified offline with `ruff check backend/ tests/`, `node --check frontend/audio_worklet.js`, and the complete Phase 1–5 pytest command: 34 tests passed, 0 live API credits spent.
+- Phase 5 remains `[ACTIVE]` only for the separately scheduled 60-second live demo recording; automated implementation and verification gates are complete in mock mode.
 
 > Phase 1 closeout note: all five foundation documents are now present for Phase 2 review. The PRD and rules confirm the 1,024-byte pacing, raw WebSocket, synthetic-data, and barge-in constraints; no cross-file conflict was found for this phase.
