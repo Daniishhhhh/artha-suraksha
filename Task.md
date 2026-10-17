@@ -43,7 +43,7 @@
 * **Estimated Effort:** 1–2 Sessions (~4 hours).
 * **RECOMMENDED MODEL:** **Claude Opus 4.8** (with **GPT "Astra"** verifying 128K context prompts) — *Opus excels at streaming async generators, tool-call loop edge cases, and sub-800 ms latency coordination.*
 
-### Phase 4: Web Audio 8 kHz Bazaar Noise Mixer & Live Judge Telemetry UI
+### Phase 4: Web Audio 8 kHz Bazaar Noise Mixer & Live Judge Telemetry UI — **[COMPLETE]**
 * **Goal:** Build the split-screen React/Tailwind frontend featuring the `AudioWorklet` PCM capture, 300–3400 Hz 8 kHz bandpass filter, synthetic bazaar/traffic noise SNR slider, `<30 ms` playback flush, and live P95 latency waterfall[cite: 9, 13].
 * **Deliverables:** `frontend/audio_worklet.js`, `frontend/noise_mixer.ts`, `frontend/telemetry_dashboard.tsx` (Screen 1).
 * **Dependencies:** Phase 2 & Phase 3 backend WebSocket contracts.
@@ -68,7 +68,7 @@
 - [x] **Phase 1 [COMPLETE]:** `.env.example`, `requirements.txt`, `backend/config.py`, `backend/database.py`, `backend/mock_replay.py`, `backend/policy_context.md`, and `tests/test_phase1_foundation.py`.
 - [x] **Phase 2 [COMPLETE]:** `backend/media_gateway.py` (1,024-byte pacer) and `backend/prisma_controller.py` (raw WSS VAD, `x-bias-list`, `<30 ms` barge-in).
 - [x] **Phase 3 [COMPLETE]:** `backend/evon_orchestrator.py` (128K context + tools) and `backend/timbre_streamer.py` (Turn-0 disclosure + clause streaming).
-- [ ] **Phase 4:** `frontend/audio_worklet.js`, `frontend/noise_mixer.ts`, and `frontend/telemetry_dashboard.tsx` (Screen 1).
+- [x] **Phase 4 [COMPLETE]:** `frontend/audio_worklet.js`, `frontend/noise_mixer.ts`, and `frontend/telemetry_dashboard.tsx` (Screen 1).
 - [ ] **Phase 5:** Batch STT (`with_denoise=True`) + Evon thinking compliance tab (Screen 2), 6-check benchmark, and 60s demo submission before Nov 10, 2026[cite: 1, 8, 13].
 
 ## 4. Notes
@@ -96,5 +96,14 @@
 
 ### Phase 3 Closeout — 2026-10-17
 - Verified zero-credit mock STT → Evon/SQLite → Timbre closed-loop behavior, Turn-0 disclosure, protected financial formatting, and barge-in cancellation.
+
+### Phase 4 Session Execution Plan — 2026-10-17
+1. Implement the AudioWorklet 16-bit mono PCM capture, exact 1,024-byte framing, TTS playback queue, and single-quantum barge-in flush.
+2. Implement the dependency-free TypeScript PSTN bandpass/noise mixer and browser WebSocket bridge bound to `/ws/call`.
+3. Build the responsive Screen 1 telemetry workbench with the Phase 5 audit-tab shell, accessibility states, and synthetic quick tests.
+4. Add static frontend/security and backend-contract tests, run all Phase 1–4 checks, and stage only Phase 4 deliverables.
+
+### Phase 4 Closeout — 2026-10-17
+- Verified the browser PCM framing, local gateway protocol, zero-secret frontend audit, Screen 1 design tokens, accessibility states, and Phase 5 placeholder shell.
 
 > Phase 1 closeout note: all five foundation documents are now present for Phase 2 review. The PRD and rules confirm the 1,024-byte pacing, raw WebSocket, synthetic-data, and barge-in constraints; no cross-file conflict was found for this phase.
