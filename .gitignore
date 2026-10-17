@@ -7,3 +7,5 @@ __pycache__/
 .mock_replay_cache/
 *.pdf
 pdf.py
+folder .md
+package-lock.json
